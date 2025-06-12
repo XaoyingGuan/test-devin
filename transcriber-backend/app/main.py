@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 import aiofiles
 import ffmpeg
 import torch
+import torchaudio
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import os
 import tempfile
@@ -62,11 +63,9 @@ def extract_audio_from_video(input_path: str, output_path: str):
         raise HTTPException(status_code=500, detail="Failed to extract audio from video")
 
 def transcribe_audio(audio_path: str, language: Optional[str] = None) -> list:
-    """Transcribe audio file using Whisper base model with proper timestamps"""
+    """Transcribe audio file using Whisper base model with improved processing"""
     try:
         load_whisper_model()
-        
-        import torchaudio
         
         waveform, sample_rate = torchaudio.load(audio_path)
         
@@ -83,87 +82,74 @@ def transcribe_audio(audio_path: str, language: Optional[str] = None) -> list:
         if processor is None or model is None:
             raise HTTPException(status_code=500, detail="Model not loaded")
         
-        chunk_length = 30 * 16000  # 30 seconds at 16kHz
+        input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+        input_features = input_features.to(device)
+        
+        generate_kwargs = {
+            "max_new_tokens": 200,
+            "do_sample": False,
+            "temperature": 0.0,
+        }
+        
+        if language and language != "auto":
+            language_map = {
+                "english": "en", "spanish": "es", "french": "fr", "german": "de",
+                "italian": "it", "portuguese": "pt", "russian": "ru", "chinese": "zh",
+                "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi", "dutch": "nl"
+            }
+            lang_code = language_map.get(language.lower(), language.lower())
+            
+            try:
+                forced_decoder_ids = processor.get_decoder_prompt_ids(language=lang_code, task="transcribe")
+                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
+            except Exception as e:
+                logger.warning(f"Could not set language {language}, using auto-detect: {e}")
+        
+        predicted_ids = model.generate(input_features, **generate_kwargs)
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+        
         segments = []
         current_speaker = 1
         
-        for chunk_start in range(0, len(audio), chunk_length):
-            chunk_end = min(chunk_start + chunk_length, len(audio))
-            audio_chunk = audio[chunk_start:chunk_end]
-            chunk_start_time = chunk_start / 16000
+        if transcription and transcription[0].strip():
+            text = transcription[0].strip()
             
-            if len(audio_chunk) < 16000:  # Skip chunks shorter than 1 second
-                continue
+            sentences = []
+            for delimiter in ['. ', '! ', '? ', '。', '！', '？']:
+                if delimiter in text:
+                    parts = text.split(delimiter)
+                    for i, part in enumerate(parts[:-1]):
+                        sentences.append(part.strip() + delimiter.strip())
+                    if parts[-1].strip():
+                        sentences.append(parts[-1].strip())
+                    break
+            else:
+                sentences = [text]
             
-            input_features = processor(audio_chunk, sampling_rate=16000, return_tensors="pt").input_features
-            input_features = input_features.to(device)
-            
-            generate_kwargs = {
-                "return_timestamps": True,
-                "max_new_tokens": 200,
-            }
-            
-            if language and language != "auto":
-                language_map = {
-                    "english": "en", "spanish": "es", "french": "fr", "german": "de",
-                    "italian": "it", "portuguese": "pt", "russian": "ru", "chinese": "zh",
-                    "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi", "dutch": "nl"
-                }
-                lang_code = language_map.get(language.lower(), language.lower())
+            if sentences:
+                segment_duration = total_duration / len(sentences)
                 
-                try:
-                    forced_decoder_ids = processor.get_decoder_prompt_ids(language=lang_code, task="transcribe")
-                    generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
-                except Exception as e:
-                    logger.warning(f"Could not set language {language}, using auto-detect: {e}")
-            
-            predicted_ids = model.generate(input_features, **generate_kwargs)
-            transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-            
-            if transcription and transcription[0].strip():
-                text = transcription[0].strip()
-                
-                sentences = []
-                for delimiter in ['. ', '! ', '? ', '。', '！', '？']:
-                    if delimiter in text:
-                        parts = text.split(delimiter)
-                        for i, part in enumerate(parts[:-1]):
-                            sentences.append(part.strip() + delimiter.strip())
-                        if parts[-1].strip():
-                            sentences.append(parts[-1].strip())
-                        break
-                else:
-                    sentences = [text]
-                
-                chunk_duration = len(audio_chunk) / 16000
-                
-                if sentences:
-                    segment_duration = chunk_duration / len(sentences)
-                    
-                    for i, sentence in enumerate(sentences):
-                        if sentence.strip():
-                            start_time = chunk_start_time + (i * segment_duration)
-                            end_time = chunk_start_time + min((i + 1) * segment_duration, chunk_duration)
-                            
-                            if segments and start_time - segments[-1]["end"] > 2.0:
-                                current_speaker = 2 if current_speaker == 1 else 1
-                            
-                            segments.append({
-                                "start": start_time,
-                                "end": end_time,
-                                "text": sentence.strip(),
-                                "speaker": f"Speaker {current_speaker}"
-                            })
-                else:
-                    if segments and chunk_start_time - segments[-1]["end"] > 2.0:
-                        current_speaker = 2 if current_speaker == 1 else 1
-                    
-                    segments.append({
-                        "start": chunk_start_time,
-                        "end": chunk_start_time + chunk_duration,
-                        "text": text,
-                        "speaker": f"Speaker {current_speaker}"
-                    })
+                for i, sentence in enumerate(sentences):
+                    if sentence.strip():
+                        start_time = i * segment_duration
+                        end_time = min((i + 1) * segment_duration, total_duration)
+                        
+                        if segments and start_time - segments[-1]["end"] > 2.0:
+                            current_speaker = 2 if current_speaker == 1 else 1
+                        
+                        segments.append({
+                            "start": start_time,
+                            "end": end_time,
+                            "text": sentence.strip(),
+                            "speaker": f"Speaker {current_speaker}"
+                        })
+            else:
+                segments.append({
+                    "start": 0.0,
+                    "end": total_duration,
+                    "text": text,
+                    "speaker": "Speaker 1"
+                })
         
         if not segments:
             segments.append({
