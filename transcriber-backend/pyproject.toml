@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "app"
+version = "0.1.0"
+description = ""
+authors = ["Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = {extras = ["standard"], version = "^0.115.12"}
+psycopg = {extras = ["binary"], version = "^3.2.9"}
+python-multipart = "^0.0.20"
+aiofiles = "^24.1.0"
+ffmpeg-python = "^0.2.0"
+requests = "^2.32.4"
+transformers = "^4.52.4"
+datasets = "^3.6.0"
+torch = {version = "^2.7.1+cpu", source = "pytorch-cpu"}
+torchaudio = {version = "^2.7.1+cpu", source = "pytorch-cpu"}
+
+
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
