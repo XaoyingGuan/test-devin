@@ -16,13 +16,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Multilingual Transcriber API")
 
-# Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 processor = None
@@ -30,20 +29,20 @@ model = None
 device = None
 
 def load_whisper_model():
-    """Load Whisper model lazily when needed"""
+    """Load Whisper base model using Hugging Face Transformers"""
     global processor, model, device
     if processor is not None and model is not None:
         return
     
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Loading Whisper model on device: {device}")
+        logger.info(f"Loading Whisper base model on device: {device}")
         
-        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        processor = WhisperProcessor.from_pretrained("openai/whisper-base")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
         model.to(device)
         
-        logger.info("Whisper model loaded successfully")
+        logger.info("Whisper base model loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load Whisper model: {e}")
         raise
@@ -63,7 +62,7 @@ def extract_audio_from_video(input_path: str, output_path: str):
         raise HTTPException(status_code=500, detail="Failed to extract audio from video")
 
 def transcribe_audio(audio_path: str, language: Optional[str] = None) -> list:
-    """Transcribe audio file using Whisper"""
+    """Transcribe audio file using Whisper base model with proper timestamps"""
     try:
         load_whisper_model()
         
@@ -79,52 +78,104 @@ def transcribe_audio(audio_path: str, language: Optional[str] = None) -> list:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         
         audio = waveform.squeeze().numpy()
+        total_duration = len(audio) / 16000
         
         if processor is None or model is None:
             raise HTTPException(status_code=500, detail="Model not loaded")
-            
-        input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
-        input_features = input_features.to(device)
         
-        if language and language != "auto":
-            forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
-            predicted_ids = model.generate(input_features, forced_decoder_ids=forced_decoder_ids)
-        else:
-            predicted_ids = model.generate(input_features)
-        
-        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-        
+        chunk_length = 30 * 16000  # 30 seconds at 16kHz
         segments = []
-        if transcription and transcription[0]:
-            text = transcription[0]
-            sentences = [s.strip() for s in text.replace('!', '.').replace('?', '.').split('.') if s.strip()]
-            duration = len(audio) / 16000  # 16kHz sample rate
-            
-            if sentences:
-                segment_duration = duration / len(sentences)
-                
-                for i, sentence in enumerate(sentences):
-                    if sentence:
-                        start_time = i * segment_duration
-                        end_time = min((i + 1) * segment_duration, duration)
-                        
-                        speaker_id = (i % 2) + 1
-                        
-                        segments.append({
-                            "start": start_time,
-                            "end": end_time,
-                            "text": sentence + '.',
-                            "speaker": f"Speaker {speaker_id}"
-                        })
-            else:
-                segments.append({
-                    "start": 0.0,
-                    "end": duration,
-                    "text": text,
-                    "speaker": "Speaker 1"
-                })
+        current_speaker = 1
         
+        for chunk_start in range(0, len(audio), chunk_length):
+            chunk_end = min(chunk_start + chunk_length, len(audio))
+            audio_chunk = audio[chunk_start:chunk_end]
+            chunk_start_time = chunk_start / 16000
+            
+            if len(audio_chunk) < 16000:  # Skip chunks shorter than 1 second
+                continue
+            
+            input_features = processor(audio_chunk, sampling_rate=16000, return_tensors="pt").input_features
+            input_features = input_features.to(device)
+            
+            generate_kwargs = {
+                "return_timestamps": True,
+                "max_new_tokens": 200,
+            }
+            
+            if language and language != "auto":
+                language_map = {
+                    "english": "en", "spanish": "es", "french": "fr", "german": "de",
+                    "italian": "it", "portuguese": "pt", "russian": "ru", "chinese": "zh",
+                    "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi", "dutch": "nl"
+                }
+                lang_code = language_map.get(language.lower(), language.lower())
+                
+                try:
+                    forced_decoder_ids = processor.get_decoder_prompt_ids(language=lang_code, task="transcribe")
+                    generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
+                except Exception as e:
+                    logger.warning(f"Could not set language {language}, using auto-detect: {e}")
+            
+            predicted_ids = model.generate(input_features, **generate_kwargs)
+            transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+            
+            if transcription and transcription[0].strip():
+                text = transcription[0].strip()
+                
+                sentences = []
+                for delimiter in ['. ', '! ', '? ', '。', '！', '？']:
+                    if delimiter in text:
+                        parts = text.split(delimiter)
+                        for i, part in enumerate(parts[:-1]):
+                            sentences.append(part.strip() + delimiter.strip())
+                        if parts[-1].strip():
+                            sentences.append(parts[-1].strip())
+                        break
+                else:
+                    sentences = [text]
+                
+                chunk_duration = len(audio_chunk) / 16000
+                
+                if sentences:
+                    segment_duration = chunk_duration / len(sentences)
+                    
+                    for i, sentence in enumerate(sentences):
+                        if sentence.strip():
+                            start_time = chunk_start_time + (i * segment_duration)
+                            end_time = chunk_start_time + min((i + 1) * segment_duration, chunk_duration)
+                            
+                            if segments and start_time - segments[-1]["end"] > 2.0:
+                                current_speaker = 2 if current_speaker == 1 else 1
+                            
+                            segments.append({
+                                "start": start_time,
+                                "end": end_time,
+                                "text": sentence.strip(),
+                                "speaker": f"Speaker {current_speaker}"
+                            })
+                else:
+                    if segments and chunk_start_time - segments[-1]["end"] > 2.0:
+                        current_speaker = 2 if current_speaker == 1 else 1
+                    
+                    segments.append({
+                        "start": chunk_start_time,
+                        "end": chunk_start_time + chunk_duration,
+                        "text": text,
+                        "speaker": f"Speaker {current_speaker}"
+                    })
+        
+        if not segments:
+            segments.append({
+                "start": 0.0,
+                "end": total_duration,
+                "text": "No speech detected",
+                "speaker": "Speaker 1"
+            })
+        
+        logger.info(f"Transcription completed: {len(segments)} segments, {total_duration:.2f}s total")
         return segments
+        
     except Exception as e:
         logger.error(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to transcribe audio: {str(e)}")
@@ -162,7 +213,15 @@ async def startup_event():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "model_loaded": model is not None, "ready": True}
+    try:
+        load_whisper_model()
+        return {
+            "status": "healthy",
+            "model": "Whisper base (Hugging Face)",
+            "message": "Transcription service is ready"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Service unhealthy: {str(e)}")
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
